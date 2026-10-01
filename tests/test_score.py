@@ -211,3 +211,104 @@ def test_credit_exhaustion_is_fatal() -> None:
     )
     with pytest.raises(FatalScoringError, match="insufficient credit"):
         scorer(FakeClient(err)).score(JOB)
+
+
+# --- model negotiation (Claude Sonnet 5.5 rejects forced tool use) ---------------------------
+
+FORCED_REJECTED = 'tool_choice: type "tool" and "any" are not supported for this model.'
+
+
+def bad_request(msg: str) -> anthropic.BadRequestError:
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return anthropic.BadRequestError(msg, response=httpx.Response(400, request=req), body=None)
+
+
+def test_forced_tool_choice_rejected_falls_back_to_auto_and_remembers() -> None:
+    client = FakeClient(bad_request(FORCED_REJECTED), response(), response())
+    s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
+    assert s.score(JOB).result.score == 82
+    assert client.calls[0]["tool_choice"]["type"] == "tool"
+    assert client.calls[1]["tool_choice"] == {"type": "auto"}
+    assert s.tool_mode == "auto"
+    s.score(JOB)  # the next job goes straight to auto: no wasted rejected call
+    assert len(client.calls) == 3 and client.calls[2]["tool_choice"] == {"type": "auto"}
+
+
+def test_effort_sent_except_for_haiku_and_dropped_if_rejected() -> None:
+    haiku = FakeClient(response())
+    scorer(haiku).score(JOB)
+    assert "output_config" not in haiku.calls[0]  # Haiku 4.5 rejects effort
+
+    client = FakeClient(bad_request("output_config.effort: not supported"), response())
+    s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
+    assert s.effort == "low" and client.calls == []
+    s.score(JOB)
+    assert client.calls[0]["output_config"] == {"effort": "low"}
+    assert "output_config" not in client.calls[1] and s.effort is None
+
+
+def test_both_features_can_be_negotiated_away_in_one_score() -> None:
+    client = FakeClient(
+        bad_request(FORCED_REJECTED), bad_request("output_config.effort: nope"), response()
+    )
+    s = ClaudeScorer(client, "unknown-model", "SYSTEM", sleep=lambda x: None)
+    assert s.score(JOB).result.score == 82
+    last = client.calls[-1]
+    assert last["tool_choice"] == {"type": "auto"} and "output_config" not in last
+
+
+def test_unrelated_400_is_not_swallowed_by_negotiation() -> None:
+    client = FakeClient(bad_request("messages.0.content: invalid"), response())
+    with pytest.raises(ScoringError, match="messages.0.content"):
+        ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM").score(JOB)
+    assert len(client.calls) == 1
+
+
+def test_max_tokens_leaves_room_for_thinking() -> None:
+    client = FakeClient(response())
+    scorer(client).score(JOB)
+    assert client.calls[0]["max_tokens"] >= 2000
+
+
+def test_auto_mode_nudges_once_when_model_answers_in_prose() -> None:
+    prose = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="I would score this 80.")],
+        usage=SimpleNamespace(input_tokens=400, output_tokens=20),
+    )
+    thinking_then_tool = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="tool_use", name=TOOL_NAME, input=GOOD),
+        ],
+        usage=SimpleNamespace(input_tokens=420, output_tokens=90),
+    )
+    client = FakeClient(bad_request(FORCED_REJECTED), prose, thinking_then_tool)
+    s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
+    out = s.score(JOB)
+    assert out.result.score == 82  # thinking blocks are ignored, the tool call is found
+    assert "Call the record_score tool" in client.calls[2]["messages"][0]["content"]
+    assert out.usage.input_tokens == 820 and out.usage.output_tokens == 110  # both calls billed
+
+
+def test_auto_mode_gives_up_after_one_nudge() -> None:
+    prose = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="no tool")],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+    client = FakeClient(bad_request(FORCED_REJECTED), prose, prose)
+    s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
+    with pytest.raises(ScoringError, match="no record_score"):
+        s.score(JOB)
+    assert len(client.calls) == 3
+
+
+def test_pricing_matches_published_rates_per_model() -> None:
+    u = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
+    assert estimate_cost("claude-haiku-4-5", u) == pytest.approx(1 + 5)
+    assert estimate_cost("claude-sonnet-5-5", u) == pytest.approx(2 + 10)
+    assert estimate_cost("claude-sonnet-4-6", u) == pytest.approx(3 + 15)
+    assert estimate_cost("claude-opus-5-5", u) == pytest.approx(4 + 20)
+    assert estimate_cost("claude-opus-4-8", u) == pytest.approx(5 + 25)
+    assert estimate_cost("claude-fable-5-1", u) == pytest.approx(10 + 50)
+    cached = Usage(cache_read_tokens=1_000_000, cache_write_tokens=1_000_000)
+    assert estimate_cost("claude-sonnet-5-5", cached) == pytest.approx(0.2 + 2.5)  # 0.1x / 1.25x

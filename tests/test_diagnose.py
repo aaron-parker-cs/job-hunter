@@ -25,15 +25,37 @@ def reply(text: str | None) -> Any:
     return SimpleNamespace(content=blocks, usage=SimpleNamespace(input_tokens=20, output_tokens=2))
 
 
+def scoring_reply() -> Any:
+    from types import SimpleNamespace
+
+    block = SimpleNamespace(
+        type="tool_use",
+        name="record_score",
+        input={
+            "score": 82,
+            "verdict": "strong",
+            "reasons": ["fits"],
+            "concerns": [],
+            "seniority_match": True,
+            "est_salary_ok": True,
+        },
+    )
+    usage = SimpleNamespace(input_tokens=900, output_tokens=60)
+    return SimpleNamespace(content=[block], usage=usage)
+
+
 class Client:
     def __init__(self, outcome: Exception | None) -> None:
         self.outcome = outcome
         self.messages = self
 
     def create(self, **kw: Any) -> object:
-        self.last = kw
+        self.calls = getattr(self, "calls", []) + [kw]
+        self.last = self.calls[0]  # the plain test prompt, not the later scoring request
         if self.outcome:
             raise self.outcome
+        if "tools" in kw:  # the scoring request
+            return scoring_reply()
         return reply("pong")
 
 
@@ -174,6 +196,7 @@ def test_success_prints_the_models_reply_and_usage() -> None:
     assert code == 0
     assert "response: 'pong'" in text
     assert "usage: 20 input + 2 output tokens" in text
+    assert "scoring request: OK (sample job scored 82/100, strong; tool_choice=forced" in text
 
 
 def test_sends_a_real_prompt_not_a_one_token_ping() -> None:
@@ -242,3 +265,53 @@ def test_cli_flag_needs_no_subcommand_and_uses_config_model(
     with pytest.raises(SystemExit):  # no command and no flag is still an error
         cli.main([])
     assert "required" in capsys.readouterr().err
+
+
+def test_scoring_request_failure_fails_the_check_even_if_ping_works() -> None:
+    """The failure mode that bit Sonnet 5.5: a plain prompt works, the scoring request does not."""
+
+    class PingOnly(Client):
+        def create(self, **kw: Any) -> object:
+            if "tools" in kw:
+                raise status_error(anthropic.BadRequestError, 400, "tools.0: not supported")
+            return reply("pong")
+
+    lines: list[str] = []
+    code = check_anthropic(
+        "some-model",
+        environ={"ANTHROPIC_API_KEY": GOOD},
+        client_factory=lambda k: PingOnly(None),
+        out=lines.append,
+        from_file=set(),
+        shadowed=[],
+    )
+    text = "\n".join(lines)
+    assert code == 1 and "request: OK" in text
+    assert "scoring request: FAILED" in text and "tools.0: not supported" in text
+
+
+def test_check_adapts_to_a_model_that_refuses_forced_tool_use() -> None:
+    class NoForcedTools(Client):
+        def create(self, **kw: Any) -> object:
+            self.calls = getattr(self, "calls", []) + [kw]
+            if "tools" in kw:
+                if kw["tool_choice"]["type"] != "auto":
+                    raise status_error(
+                        anthropic.BadRequestError,
+                        400,
+                        'tool_choice: type "tool" and "any" are not supported for this model.',
+                    )
+                return scoring_reply()
+            return reply("pong")
+
+    lines: list[str] = []
+    code = check_anthropic(
+        "claude-sonnet-5-5",
+        environ={"ANTHROPIC_API_KEY": GOOD},
+        client_factory=lambda k: NoForcedTools(None),
+        out=lines.append,
+        from_file=set(),
+        shadowed=[],
+    )
+    assert code == 0
+    assert any("tool_choice=auto" in line and "effort=low" in line for line in lines)

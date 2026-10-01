@@ -165,7 +165,7 @@ table and counts equally.
 | `timezone` | `America/Chicago` | IANA timezone name |
 | `exclude_companies` | `[]` | Company names to drop (case/punctuation-insensitive) |
 | `exclude_title_keywords` | `[]` | Whole-word, case-insensitive: `intern` won't match "International" |
-| `scoring.model` | `claude-haiku-4-5` | Verify the current id in Anthropic's docs |
+| `scoring.model` | `claude-haiku-4-5` | Any current Claude model, e.g. `claude-sonnet-5-5`. Requests adapt to what the model accepts (see below). Verify ids in Anthropic's docs |
 | `scoring.min_score_to_notify` | `70` | Score (0-100) needed to notify |
 | `scoring.max_jobs_scored_per_run` | `60` | Cost guardrail per run |
 | `notifier` | `telegram` | `telegram`, `discord` or `both` |
@@ -189,6 +189,15 @@ minutes) per notifier**, highest score first. So 8 matches take about 35 minutes
 - The "nothing matched" digest and failure notices are sent immediately.
 - `python -m job_hunter once` is a manual one-off and sends everything immediately.
 - Prefer silence over spacing? Raise the value (e.g. `1800`). Prefer everything at once? Use `0`.
+
+### Choosing a scoring model
+
+`scoring.model` can be any current Claude model. The scorer asks for structured output through a tool call and
+adapts to the model: newer models (Claude Sonnet 5.5, Opus 5.5, Fable 5.1) reject *forced* tool use, so the
+first rejected request switches that scorer to `tool_choice: auto` (with one re-ask if the model answers in
+prose), and `effort: low` is sent where supported and dropped where it isn't (Haiku 4.5). Replies leave room
+for the model's thinking tokens. `python -m job_hunter --model <id> --test-anthropic` runs this exact request
+on a sample job and reports which settings the model ended up using, so test a new model before a real run.
 
 ### Environment variables (non-secret)
 
@@ -271,7 +280,8 @@ a heartbeat-based healthcheck, and no data, `.env` or secrets baked into the ima
 ## Cost and guardrails
 
 Each new in-radius job is scored with one small Claude call (a few thousand input tokens, ~150 output
-tokens). With Haiku that is roughly **$0.003 per job** as an order-of-magnitude estimate. The large,
+tokens). With Haiku that is roughly **$0.003 per job** as an order-of-magnitude estimate; Claude Sonnet 5.5
+(about twice Haiku's per-token price, plus any thinking tokens) is roughly twice that. The large,
 stable part of the prompt (instructions + resume + profile + recent feedback) is marked for prompt
 caching; very short prompts may fall below the model's minimum cacheable size and pay full price.
 
@@ -283,8 +293,8 @@ Guardrails, in the order they bite:
    digest mentions it (when nothing matched), and skipped jobs are scored next run.
 3. `/status` shows spend against the cap.
 
-Costs are **estimates** from a built-in price table (unknown models are costed at the most expensive
-tier). Check real usage in the Anthropic console, and verify the price table in `score.py` against
+Costs are **estimates** from a built-in per-model price table (Haiku, Sonnet 5.x and 4.x, Opus, Fable;
+unknown models are costed at the most expensive tier). Check real usage in the Anthropic console, and verify the price table in `score.py` against
 Anthropic's current pricing.
 
 ## Rate limits and scraping etiquette

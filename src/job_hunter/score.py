@@ -1,4 +1,4 @@
-"""Claude scoring with forced structured output, prompt caching and cost accounting."""
+"""Claude scoring with structured output (tool call), prompt caching and cost accounting."""
 
 from __future__ import annotations
 
@@ -19,14 +19,25 @@ log = logging.getLogger(__name__)
 TOOL_NAME = "record_score"
 MAX_ATTEMPTS = 4
 
-# USD per million tokens: (input, output). Cache writes cost 1.25x input, reads 0.1x.
-# These are estimates for guardrails; verify against Anthropic's pricing page.
-PRICING: dict[str, tuple[float, float]] = {
-    "haiku": (1.0, 5.0),
-    "sonnet": (3.0, 15.0),
-    "opus": (5.0, 25.0),
-}
-_FALLBACK_PRICING = (5.0, 25.0)  # unknown model: assume the most expensive tier
+# USD per million tokens: (input, output), first substring match wins, so specific names
+# come before general ones. Cache writes cost 1.25x input, cache reads 0.1x. Thinking tokens are
+# billed (and reported) as output. Estimates for guardrails, from Anthropic's published prices
+# as of 2026-09-25; verify against the pricing page.
+PRICING: list[tuple[str, tuple[float, float]]] = [
+    ("fable", (10.0, 50.0)),
+    ("mythos", (10.0, 50.0)),
+    ("opus-5-5", (4.0, 20.0)),
+    ("opus", (5.0, 25.0)),
+    ("sonnet-5", (2.0, 10.0)),
+    ("sonnet", (3.0, 15.0)),
+    ("haiku", (1.0, 5.0)),
+]
+_FALLBACK_PRICING = (10.0, 50.0)  # unknown model: assume the most expensive tier
+
+# Newer models can think before answering, and thinking tokens count against max_tokens, so
+# leave plenty of room or the tool call could be cut off.
+MAX_TOKENS = 2000
+NUDGE = "\n\nCall the record_score tool now with your evaluation."
 
 
 class ScoringError(RuntimeError):
@@ -155,7 +166,7 @@ def format_job(job: Job) -> str:
 
 
 def estimate_cost(model: str, usage: Usage) -> float:
-    rates = next((r for key, r in PRICING.items() if key in model), None)
+    rates = next((r for key, r in PRICING if key in model), None)
     if rates is None:
         log.warning("no pricing for model %r; assuming highest tier", model)
         rates = _FALLBACK_PRICING
@@ -173,6 +184,24 @@ def _describe(exc: Exception) -> str:
     if isinstance(exc, anthropic.APIStatusError):
         return f"{type(exc).__name__} {exc.status_code}: {str(exc.message)[:300]}"
     return type(exc).__name__
+
+
+def _tool_input(response: Any) -> Any:
+    """The record_score tool input, or None (thinking and text blocks are ignored)."""
+    return next(
+        (b.input for b in response.content if b.type == "tool_use" and b.name == TOOL_NAME),
+        None,
+    )
+
+
+def _usage_of(response: Any) -> Usage:
+    u = response.usage
+    return Usage(
+        input_tokens=u.input_tokens or 0,
+        output_tokens=u.output_tokens or 0,
+        cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+    )
 
 
 def _retryable(exc: Exception) -> bool:
@@ -199,25 +228,32 @@ class ClaudeScorer:
             {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
         ]
         self._sleep = sleep
+        # Request features that not every model accepts. Both are negotiated at runtime: if the
+        # API rejects one, we drop it (once, for the life of this scorer) and retry.
+        self.tool_mode: Literal["forced", "auto"] = "forced"
+        self.effort: str | None = None if "haiku" in model else "low"
 
     def score(self, job: Job) -> ScoreOutcome:
-        response = self._call(format_job(job))
-        raw = next(
-            (b.input for b in response.content if b.type == "tool_use" and b.name == TOOL_NAME),
-            None,
-        )
+        text = format_job(job)
+        usages: list[Usage] = []
+        raw = None
+        for nudge in ("", NUDGE):
+            response = self._call(text + nudge)
+            usages.append(_usage_of(response))
+            raw = _tool_input(response)
+            if raw is not None or self.tool_mode == "forced":
+                break  # with tool_choice=auto the model may answer in prose: ask once more
         if raw is None:
             raise ScoringError(f"no {TOOL_NAME} tool call in response for {job.id[:8]}")
         try:
             result = ScoreResult.model_validate(raw)
         except (ValidationError, ValueError, TypeError) as exc:
             raise ScoringError(f"invalid score payload for {job.id[:8]}: {exc}") from None
-        u = response.usage
         usage = Usage(
-            input_tokens=u.input_tokens or 0,
-            output_tokens=u.output_tokens or 0,
-            cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-            cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+            input_tokens=sum(u.input_tokens for u in usages),
+            output_tokens=sum(u.output_tokens for u in usages),
+            cache_write_tokens=sum(u.cache_write_tokens for u in usages),
+            cache_read_tokens=sum(u.cache_read_tokens for u in usages),
         )
         return ScoreOutcome(
             result=result,
@@ -226,17 +262,39 @@ class ClaudeScorer:
             cost_usd=estimate_cost(self._model, usage),
         )
 
+    def _params(self, user_text: str) -> dict[str, Any]:
+        tool_choice: dict[str, str] = (
+            {"type": "tool", "name": TOOL_NAME} if self.tool_mode == "forced" else {"type": "auto"}
+        )
+        params: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": MAX_TOKENS,
+            "system": self._system,
+            "tools": [TOOL],
+            "tool_choice": tool_choice,
+            "messages": [{"role": "user", "content": user_text}],
+        }
+        if self.effort:
+            params["output_config"] = {"effort": self.effort}
+        return params
+
+    def _adapt(self, message: str) -> bool:
+        """React to a 400 that blames a request feature; True if we changed something."""
+        low = message.lower()
+        if "tool_choice" in low and self.tool_mode == "forced":
+            self.tool_mode = "auto"
+            log.info("%s does not accept forced tool use; using tool_choice=auto", self._model)
+            return True
+        if ("effort" in low or "output_config" in low) and self.effort:
+            self.effort = None
+            log.info("%s does not accept effort; sending requests without it", self._model)
+            return True
+        return False
+
     def _call(self, user_text: str) -> Any:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                return self._client.messages.create(
-                    model=self._model,
-                    max_tokens=600,
-                    system=self._system,
-                    tools=[TOOL],
-                    tool_choice={"type": "tool", "name": TOOL_NAME},
-                    messages=[{"role": "user", "content": user_text}],
-                )
+                return self._client.messages.create(**self._params(user_text))
             except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
                 raise FatalScoringError(
                     f"Anthropic rejected the API key ({_describe(exc)}); "
@@ -248,6 +306,8 @@ class ClaudeScorer:
                 ) from None
             except Exception as exc:
                 detail = _describe(exc)
+                if isinstance(exc, anthropic.BadRequestError) and self._adapt(str(exc.message)):
+                    continue  # request adjusted to what this model accepts: try again
                 if (
                     isinstance(exc, anthropic.BadRequestError)
                     and "credit balance" in detail.lower()

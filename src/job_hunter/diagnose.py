@@ -13,11 +13,32 @@ from typing import Any
 import anthropic
 
 from job_hunter import config
-from job_hunter.score import Usage, estimate_cost
+from job_hunter.models import Job
+from job_hunter.score import (
+    ClaudeScorer,
+    ScoringError,
+    Usage,
+    build_system_prompt,
+    estimate_cost,
+)
 
 KEY_VAR = "ANTHROPIC_API_KEY"
 EXPECTED_PREFIX = "sk-ant-"
 TEST_PROMPT = "Reply with exactly one word: pong"
+SAMPLE_JOB = Job(
+    id="0" * 64,
+    url="https://example.com/sample",
+    title="DevOps Engineer",
+    company="Example Co",
+    location="Remote",
+    is_remote=True,
+    salary_min=120000,
+    salary_max=150000,
+    salary_interval="yearly",
+    date_posted=None,
+    description="Run Kubernetes clusters and Terraform pipelines for a small remote team.",
+    site="test",
+)
 
 
 def key_problems(key: str) -> list[str]:
@@ -68,7 +89,8 @@ def check_anthropic(
     client_factory: Callable[[str], Any] | None = None,
     out: Callable[[str], None] = print,
 ) -> int:
-    """Send a real test prompt. 0 = key accepted and a reply came back; 1 = rejected or no
+    """Send a test prompt, then a real scoring request. 0 = key accepted, a reply came back and
+    the scoring request works on this model; 1 = rejected or no
     reply; 2 = no key set."""
     env = os.environ if environ is None else environ
     files = config.ENV_FROM_FILE if from_file is None else from_file
@@ -94,9 +116,11 @@ def check_anthropic(
     factory = client_factory or (
         lambda k: anthropic.Anthropic(api_key=k, max_retries=0, timeout=30.0)
     )
+    client = factory(key.strip())
     try:
-        response = factory(key.strip()).messages.create(
-            model=model, max_tokens=40, messages=[{"role": "user", "content": TEST_PROMPT}]
+        # Generous max_tokens: newer models may think first, and thinking counts against it.
+        response = client.messages.create(
+            model=model, max_tokens=300, messages=[{"role": "user", "content": TEST_PROMPT}]
         )
     except anthropic.APIStatusError as exc:
         out(f"request: REJECTED, HTTP {exc.status_code}: {str(exc.message)[:300]}")
@@ -122,4 +146,30 @@ def check_anthropic(
             f"usage: {tokens.input_tokens} input + {tokens.output_tokens} output tokens "
             f"(about ${estimate_cost(model, tokens):.6f})"
         )
+    return _check_scoring_request(client, model, out)
+
+
+def _check_scoring_request(client: Any, model: str, out: Callable[[str], None]) -> int:
+    """Run the real scoring request on a sample job, so model quirks show up here, not mid-run."""
+    scorer = ClaudeScorer(
+        client,
+        model,
+        build_system_prompt(
+            "Five years of Linux administration, Kubernetes and Terraform.",
+            "Wants a remote DevOps or platform role paying 110k or more.",
+        ),
+    )
+    try:
+        outcome = scorer.score(SAMPLE_JOB)
+    except ScoringError as exc:
+        out(f"scoring request: FAILED: {exc}")
+        return 1
+    notes = [f"tool_choice={scorer.tool_mode}"]
+    if scorer.effort:
+        notes.append(f"effort={scorer.effort}")
+    r = outcome.result
+    out(
+        f"scoring request: OK (sample job scored {r.score}/100, {r.verdict}; {', '.join(notes)}; "
+        f"about ${outcome.cost_usd:.5f})"
+    )
     return 0
