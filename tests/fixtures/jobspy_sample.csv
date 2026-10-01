@@ -1,0 +1,9 @@
+id,site,job_url,title,company,location,date_posted,job_type,interval,min_amount,max_amount,currency,is_remote,description
+in-1,indeed,https://indeed.example/1,DevOps Engineer,Acme Corp,"Austin, TX, US",2026-09-29,fulltime,yearly,110000,140000,USD,False,Run our pipelines.
+li-1,linkedin,https://linkedin.example/1,DevOps Engineer,ACME Corp.,"Austin, TX, US",2026-09-29,fulltime,,,,,False,Same job reposted on another board.
+in-2,indeed,https://indeed.example/2,Senior Director of Platform,BigCo,"Austin, TX, US",2026-09-29,fulltime,,,,,False,Excluded by title.
+in-3,indeed,https://indeed.example/3,Systems Engineer,FarAway Inc,"Dallas, TX, US",2026-09-28,fulltime,,,,,False,Too far from home.
+in-4,indeed,https://indeed.example/4,Systems Engineer,RemoteCo,"Nowhere, US",2026-09-28,fulltime,,,,,True,Remote role.
+in-5,indeed,https://indeed.example/5,Intern Systems Engineer,Acme Corp,"Austin, TX, US",2026-09-28,internship,,,,,False,Excluded by title.
+in-6,indeed,https://indeed.example/6,SRE,Mystery LLC,Somewhere Weird,,fulltime,,,,,False,Geocode fails.
+in-7,indeed,https://indeed.example/7,,NoTitle,"Austin, TX, US",,,,,,,False,Dropped: no title.

@@ -1,0 +1,26 @@
+home_location: "Your City, ST"
+radius_miles: 50
+include_remote: true
+searches:
+  - term: "Systems Engineer"
+  - term: "DevOps Engineer"
+sites: [indeed, linkedin, zip_recruiter, glassdoor]   # google: opt-in, often empty
+hours_old: 24
+results_per_search: 30
+fetch:
+  searches_per_run: 8          # more searches than this? runs rotate through them
+  delay_seconds: [3, 8]        # random pause between scrape calls
+  linkedin_fetch_description: true   # +1 request per LinkedIn job; needed for good scores
+schedule_cron: "0 7,12,18 * * *"
+timezone: America/Chicago
+exclude_companies: []
+exclude_title_keywords: ["intern", "senior director"]
+scoring:
+  model: "claude-haiku-4-5"   # verify current model id in Anthropic docs
+  min_score_to_notify: 70
+  max_jobs_scored_per_run: 60
+notifier: telegram            # telegram | discord | both
+notify:
+  cooldown_seconds: 300       # min gap between job messages (0 = all at once)
+resume_path: data/resume.md   # .md, .txt or .pdf
+profile_path: data/profile.md
