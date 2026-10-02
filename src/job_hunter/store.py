@@ -116,6 +116,10 @@ MIGRATIONS: list[str] = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 6: which search term found each job (fair scoring order, /last-scores)
+    """
+    ALTER TABLE jobs ADD COLUMN search_term TEXT;
+    """,
 ]
 
 
@@ -135,6 +139,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         site=row["site"],
         distance_miles=row["distance_miles"],
         location_unknown=bool(row["location_unknown"]),
+        search_term=row["search_term"] or "",
     )
 
 
@@ -188,8 +193,8 @@ class Store:
             """INSERT OR IGNORE INTO jobs
             (id, url, title, company, location, is_remote, salary_min, salary_max,
              salary_interval, date_posted, description, site, distance_miles,
-             location_unknown, first_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             location_unknown, first_seen, search_term)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 job.id,
                 job.url,
@@ -206,6 +211,7 @@ class Store:
                 job.distance_miles,
                 int(job.location_unknown),
                 _now(),
+                job.search_term or None,
             ),
         )
         self.conn.commit()

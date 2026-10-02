@@ -28,6 +28,7 @@ class Job:
     site: str
     distance_miles: float | None = None
     location_unknown: bool = False
+    search_term: str = ""  # the configured search that found it (first one, if several)
 
 
 def _norm(text: str) -> str:

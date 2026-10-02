@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from job_hunter import settings
+from job_hunter.models import Job
 from job_hunter.notify.base import format_salary, where_text
 
 if TYPE_CHECKING:
@@ -134,10 +135,15 @@ def last_scores_text(service: Service, arg: str | None = None, *, wrap_links: bo
         link = f"<{job.url}>" if wrap_links else job.url
         why = explanation or result.explanation or _legacy_reasons(result.reasons, result.concerns)
         blocks.append(
-            f"{i}. {mark} [{result.score}] {job.title} \u2014 {job.company} ({where_text(job)})\n"
-            f"{why}\n{link}"
+            f"{i}. {mark} [{result.score}] {job.title} \u2014 {job.company} "
+            f"({_where_and_search(job)})\n{why}\n{link}"
         )
     return "\n\n".join(blocks)
+
+
+def _where_and_search(job: Job) -> str:
+    where = where_text(job)
+    return f"{where}; search: {job.search_term}" if job.search_term else where
 
 
 def _legacy_reasons(reasons: list[str], concerns: list[str]) -> str:

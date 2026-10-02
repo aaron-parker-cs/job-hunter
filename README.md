@@ -322,6 +322,12 @@ caching; very short prompts may fall below the model's minimum cacheable size an
 Guardrails, in the order they bite:
 
 1. `scoring.max_jobs_scored_per_run` (default 60) caps a single run: worst case about 18 cents.
+   The cap is shared fairly: before scoring, candidates are interleaved round-robin across your search
+   terms (and across sites within each term), so with 4 titles and a cap of 60 each title gets about 15,
+   and a title with fewer candidates passes its unused share to the others. Without this, the first
+   title alone can return up to `results_per_search` × the number of sites and use up the whole cap. Jobs
+   that don't fit are not saved, so they're considered again next run. The log line `scored per search:
+   {...}; left for a later run: {...}` shows the split, and `/last_scores` shows which search found each job.
 2. `MAX_WEEKLY_BUDGET_USD` caps estimated spend over a rolling 7 days. It is checked before every call,
    so it can overshoot by at most one job. Dry runs count too. When it trips, the CLI says so, the
    digest mentions it (when nothing matched), and skipped jobs are scored next run.

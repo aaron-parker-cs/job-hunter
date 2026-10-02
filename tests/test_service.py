@@ -129,7 +129,7 @@ def test_state_roundtrip_and_migration_version(store: Store) -> None:
     assert store.get_state("k", "dflt") == "dflt"
     store.set_state("k", "v")
     assert store.get_state("k") == "v"
-    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_top_matches_filters_and_orders(store: Store) -> None:

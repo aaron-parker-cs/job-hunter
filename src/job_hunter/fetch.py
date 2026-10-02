@@ -99,7 +99,7 @@ def fetch_jobs(
     """
     delay = delay_range or cfg.fetch.delay_seconds
     limit = cfg.fetch.max_consecutive_failures
-    records: list[dict[str, Any]] = []
+    records: list[tuple[str, dict[str, Any]]] = []  # (search term, JobSpy row)
     errors: dict[tuple[str, ...], int] = {}  # consecutive exceptions per site group
     empty_streak: dict[str, int] = {}  # consecutive zero-row calls per site
     disabled: set[str] = set()
@@ -155,13 +155,14 @@ def fetch_jobs(
                         site,
                         empty_streak[site],
                     )
-            records.extend(rows)
+            records.extend((search.term, row) for row in rows)
     if disabled:
         log.warning("sites skipped this run after returning no rows: %s", sorted(disabled))
 
     jobs: list[Job] = []
-    for row in records:
+    for term, row in records:
         job = normalize_row(row)
         if job is not None:
+            job.search_term = term
             jobs.append(job)
     return jobs

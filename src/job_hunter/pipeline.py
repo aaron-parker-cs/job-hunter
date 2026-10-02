@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -75,6 +76,26 @@ class ScoredJob:
     outcome: ScoreOutcome
 
 
+def interleave_by_search(jobs: list[Job]) -> list[Job]:
+    """Order candidates round-robin across search terms, and across sites within each term.
+
+    Scoring stops at max_jobs_scored_per_run, and each search can return dozens of rows per
+    site, so in fetch order the first search term could take the whole cap. Interleaving gives
+    every term an equal share; a share a term can't use (too few jobs) passes to the others.
+    """
+    by_term: dict[str, dict[str, list[Job]]] = {}
+    for job in jobs:  # dicts keep first-seen order, i.e. config order
+        by_term.setdefault(job.search_term, {}).setdefault(job.site, []).append(job)
+    return _round_robin([_round_robin(list(sites.values())) for sites in by_term.values()])
+
+
+def _round_robin(groups: list[list[Job]]) -> list[Job]:
+    out: list[Job] = []
+    for i in range(max((len(g) for g in groups), default=0)):
+        out.extend(g[i] for g in groups if i < len(g))
+    return out
+
+
 def score_jobs(
     jobs: list[Job],
     cfg: Config,
@@ -136,6 +157,13 @@ def score_jobs(
                 run_id=summary.run_id or None,
             )
         results.append(ScoredJob(job, outcome))
+    if len(jobs) > 1:
+        scored_ids = {r.job.id for r in results}
+        log.info(
+            "scored per search: %s; left for a later run: %s",
+            dict(Counter(r.job.search_term for r in results)),
+            dict(Counter(j.search_term for j in jobs if j.id not in scored_ids)),
+        )
     return results
 
 
@@ -167,7 +195,8 @@ def run_once(
     candidates = [j for j in fetched if passes_static_filters(j, cfg, hidden)]
     new = dedup(candidates, store)  # before geocoding, to spare Nominatim requests
     summary.new_jobs = len(new)
-    in_radius = apply_location_filter(new, cfg, geocoder, home)
+    # Fair order before the scoring cap applies (see interleave_by_search).
+    in_radius = interleave_by_search(apply_location_filter(new, cfg, geocoder, home))
     summary.in_radius = len(in_radius)
 
     if not dry_run:
