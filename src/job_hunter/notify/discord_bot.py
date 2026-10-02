@@ -244,29 +244,62 @@ class DiscordWebhookNotifier:
         await self._client.aclose()
 
 
+DISCORD_MAX_CHARS = 2000
+
+
+async def send_reply(interaction: discord.Interaction, text: str) -> None:
+    """Send a (possibly long) private reply, split under Discord's 2000-character limit."""
+    for chunk in commands.split_message(text, DISCORD_MAX_CHARS):
+        if interaction.response.is_done():
+            await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.response.send_message(chunk, ephemeral=True)
+
+
 def register_commands(bot: DiscordBot, service: Service) -> None:
-    """Add /status /run /pause /resume /top slash commands (published in setup_hook)."""
+    """Add the slash commands (published in setup_hook). Replies are visible only to you."""
     bot.commands_enabled = True
     tree = bot.tree
 
-    @tree.command(name="status", description="Last run, next run and spend")
+    @tree.command(name="status", description="Last run, next run, spend and settings")
     async def status(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(commands.status_text(service), ephemeral=True)
+        await send_reply(interaction, commands.status_text(service))
 
     @tree.command(name="run", description="Run a search now")
     async def run(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(commands.run_text(service), ephemeral=True)
+        await send_reply(interaction, commands.run_text(service))
 
     @tree.command(name="pause", description="Pause scheduled runs")
     async def pause(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(commands.pause_text(service), ephemeral=True)
+        await send_reply(interaction, commands.pause_text(service))
 
     @tree.command(name="resume", description="Resume scheduled runs")
     async def resume(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(commands.resume_text(service), ephemeral=True)
+        await send_reply(interaction, commands.resume_text(service))
 
     @tree.command(name="top", description="Best unapplied matches this week")
     async def top(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            commands.top_text(service, wrap_links=True), ephemeral=True
-        )
+        await send_reply(interaction, commands.top_text(service, wrap_links=True))
+
+    @tree.command(name="last-scores", description="Top scores from the last run, with explanations")
+    @app_commands.describe(n="How many to show, 1-20 (default 5)")
+    async def last_scores(interaction: discord.Interaction, n: int | None = None) -> None:
+        arg = None if n is None else str(n)
+        await send_reply(interaction, commands.last_scores_text(service, arg, wrap_links=True))
+
+    @tree.command(name="threshold", description="Show or set the notify threshold (0-100)")
+    @app_commands.describe(value="0-100, or 'reset'; leave empty to see the current value")
+    async def threshold(interaction: discord.Interaction, value: str | None = None) -> None:
+        await send_reply(interaction, commands.threshold_text(service, value))
+
+    @tree.command(name="radius", description="Show or set the search radius in miles")
+    @app_commands.describe(value="Miles (1-500), or 'reset'; leave empty to see the current value")
+    async def radius(interaction: discord.Interaction, value: str | None = None) -> None:
+        await send_reply(interaction, commands.radius_text(service, value))
+
+    @tree.command(name="location", description="Show or set the home location")
+    @app_commands.describe(value="e.g. 'Tacoma, WA', or 'reset'; leave empty to see it")
+    async def location(interaction: discord.Interaction, value: str | None = None) -> None:
+        # Geocoding can take longer than Discord's 3-second reply window, so acknowledge first.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await send_reply(interaction, await commands.location_text(service, value))

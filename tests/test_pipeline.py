@@ -225,7 +225,7 @@ def test_migrations_idempotent_and_versioned(tmp_path: Path) -> None:
     path = tmp_path / "sub" / "jobs.db"
     Store(path).close()
     s = Store(path)  # reopening must not re-run migrations
-    assert s.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert s.conn.execute("PRAGMA user_version").fetchone()[0] == 5
     assert s.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     tables = {r[0] for r in s.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     expected = {"jobs", "scores", "notifications", "feedback", "runs", "geocache", "spend"}

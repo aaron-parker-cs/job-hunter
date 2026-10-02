@@ -26,22 +26,24 @@ def reply(text: str | None) -> Any:
 
 
 def scoring_reply() -> Any:
+    import json
     from types import SimpleNamespace
 
-    block = SimpleNamespace(
-        type="tool_use",
-        name="record_score",
-        input={
-            "score": 82,
-            "verdict": "strong",
-            "reasons": ["fits"],
-            "concerns": [],
-            "seniority_match": True,
-            "est_salary_ok": True,
-        },
-    )
+    payload = {
+        "explanation": "Remote DevOps role matching Kubernetes and Terraform experience.",
+        "score": 82,
+        "verdict": "strong",
+        "reasons": ["fits"],
+        "concerns": [],
+        "seniority_match": True,
+        "est_salary_ok": True,
+    }
+    blocks = [
+        SimpleNamespace(type="text", text=json.dumps(payload)),
+        SimpleNamespace(type="tool_use", name="record_score", input=payload),
+    ]
     usage = SimpleNamespace(input_tokens=900, output_tokens=60)
-    return SimpleNamespace(content=[block], usage=usage)
+    return SimpleNamespace(content=blocks, usage=usage, stop_reason="end_turn")
 
 
 class Client:
@@ -54,7 +56,7 @@ class Client:
         self.last = self.calls[0]  # the plain test prompt, not the later scoring request
         if self.outcome:
             raise self.outcome
-        if "tools" in kw:  # the scoring request
+        if "system" in kw:  # the scoring request (the plain ping has no system prompt)
             return scoring_reply()
         return reply("pong")
 
@@ -196,7 +198,8 @@ def test_success_prints_the_models_reply_and_usage() -> None:
     assert code == 0
     assert "response: 'pong'" in text
     assert "usage: 20 input + 2 output tokens" in text
-    assert "scoring request: OK (sample job scored 82/100, strong; tool_choice=forced" in text
+    assert "scoring request: OK (sample job scored 82/100, strong; output=json_schema" in text
+    assert "explanation: 'Remote DevOps role" in text
 
 
 def test_sends_a_real_prompt_not_a_one_token_ping() -> None:
@@ -272,8 +275,8 @@ def test_scoring_request_failure_fails_the_check_even_if_ping_works() -> None:
 
     class PingOnly(Client):
         def create(self, **kw: Any) -> object:
-            if "tools" in kw:
-                raise status_error(anthropic.BadRequestError, 400, "tools.0: not supported")
+            if "system" in kw:
+                raise status_error(anthropic.BadRequestError, 400, "messages.0: not supported")
             return reply("pong")
 
     lines: list[str] = []
@@ -287,31 +290,35 @@ def test_scoring_request_failure_fails_the_check_even_if_ping_works() -> None:
     )
     text = "\n".join(lines)
     assert code == 1 and "request: OK" in text
-    assert "scoring request: FAILED" in text and "tools.0: not supported" in text
+    assert "scoring request: FAILED" in text and "messages.0: not supported" in text
 
 
-def test_check_adapts_to_a_model_that_refuses_forced_tool_use() -> None:
-    class NoForcedTools(Client):
+def test_check_adapts_to_a_model_without_structured_outputs_or_forced_tools() -> None:
+    class OldModel(Client):
         def create(self, **kw: Any) -> object:
             self.calls = getattr(self, "calls", []) + [kw]
-            if "tools" in kw:
-                if kw["tool_choice"]["type"] != "auto":
-                    raise status_error(
-                        anthropic.BadRequestError,
-                        400,
-                        'tool_choice: type "tool" and "any" are not supported for this model.',
-                    )
-                return scoring_reply()
-            return reply("pong")
+            if "system" not in kw:
+                return reply("pong")
+            if "format" in kw.get("output_config", {}):
+                raise status_error(
+                    anthropic.BadRequestError, 400, "output_config.format: not supported"
+                )
+            if kw["tool_choice"]["type"] != "auto":
+                raise status_error(
+                    anthropic.BadRequestError,
+                    400,
+                    'tool_choice: type "tool" and "any" are not supported for this model.',
+                )
+            return scoring_reply()
 
     lines: list[str] = []
     code = check_anthropic(
         "claude-sonnet-5-5",
         environ={"ANTHROPIC_API_KEY": GOOD},
-        client_factory=lambda k: NoForcedTools(None),
+        client_factory=lambda k: OldModel(None),
         out=lines.append,
         from_file=set(),
         shadowed=[],
     )
     assert code == 0
-    assert any("tool_choice=auto" in line and "effort=low" in line for line in lines)
+    assert any("output=tool (auto)" in line and "effort=low" in line for line in lines)

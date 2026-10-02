@@ -105,6 +105,17 @@ MIGRATIONS: list[str] = [
         UNIQUE (notifier, job_id)
     );
     """,
+    # 5: per-score explanation and run link (for /last-scores), and chat-adjustable settings
+    """
+    ALTER TABLE scores ADD COLUMN explanation TEXT;
+    ALTER TABLE scores ADD COLUMN run_id INTEGER REFERENCES runs(id);
+    CREATE INDEX scores_run_id ON scores(run_id);
+    CREATE TABLE settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -211,12 +222,15 @@ class Store:
         output_tokens: int,
         cache_write_tokens: int,
         cache_read_tokens: int,
+        *,
+        explanation: str | None = None,
+        run_id: int | None = None,
     ) -> None:
         self.conn.execute(
             """INSERT OR REPLACE INTO scores
             (job_id, score_json, model, input_tokens, output_tokens,
-             cache_write_tokens, cache_read_tokens, created_at)
-            VALUES (?,?,?,?,?,?,?,?)""",
+             cache_write_tokens, cache_read_tokens, created_at, explanation, run_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 job_id,
                 score_json,
@@ -226,6 +240,8 @@ class Store:
                 cache_write_tokens,
                 cache_read_tokens,
                 _now(),
+                explanation,
+                run_id or None,
             ),
         )
         self.conn.commit()
@@ -348,10 +364,65 @@ class Store:
         self.conn.commit()
 
     def last_run(self) -> sqlite3.Row | None:
+        """The most recent finished run (one still in progress has no finished_at)."""
         row: sqlite3.Row | None = self.conn.execute(
-            "SELECT * FROM runs ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return row
+
+    def latest_scored_run(self) -> sqlite3.Row | None:
+        """The most recent finished run that scored at least one job."""
+        row: sqlite3.Row | None = self.conn.execute(
+            """SELECT * FROM runs WHERE finished_at IS NOT NULL AND scored > 0
+            ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        return row
+
+    def run_scores(
+        self, run: sqlite3.Row, limit: int
+    ) -> tuple[list[tuple[Job, ScoreResult, str | None]], int]:
+        """Highest scores from one run, with explanations, plus how many it scored in total.
+
+        Scores saved before run ids existed are matched by time instead: runs never overlap
+        in the service, so anything scored between a run's start and finish belongs to it.
+        """
+        rows = self.conn.execute(
+            """SELECT j.*, s.score_json, s.explanation FROM scores s
+            JOIN jobs j ON j.id = s.job_id
+            WHERE s.run_id = ?
+               OR (s.run_id IS NULL AND s.created_at >= ? AND s.created_at <= ?)
+            ORDER BY json_extract(s.score_json, '$.score') DESC, s.created_at ASC""",
+            (run["id"], run["started_at"], run["finished_at"]),
+        ).fetchall()
+        items = [
+            (
+                _row_to_job(row),
+                ScoreResult.model_validate_json(row["score_json"]),
+                row["explanation"],
+            )
+            for row in rows[:limit]
+        ]
+        return items, len(rows)
+
+    # --- settings (chat-adjustable overrides of config.yaml) -----------------------------
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, _now()),
+        )
+        self.conn.commit()
+
+    def delete_setting(self, key: str) -> None:
+        self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        self.conn.commit()
+
+    def all_settings(self) -> dict[str, str]:
+        return {r[0]: r[1] for r in self.conn.execute("SELECT key, value FROM settings")}
 
     def top_matches(
         self, *, since: datetime, min_score: int, limit: int = 5
@@ -421,6 +492,29 @@ class Store:
         self.conn.commit()
 
     # --- runs -----------------------------------------------------------
+
+    def start_run(self, started_at: str) -> int:
+        """Create the run row up front, so scores saved during the run can reference it."""
+        cur = self.conn.execute("INSERT INTO runs (started_at) VALUES (?)", (started_at,))
+        self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def finish_run(self, run_id: int, summary: RunSummary) -> None:
+        self.conn.execute(
+            """UPDATE runs SET finished_at = ?, fetched = ?, new_jobs = ?, in_radius = ?,
+               scored = ?, sent = ?, cost_estimate = ? WHERE id = ?""",
+            (
+                _now(),
+                summary.fetched,
+                summary.new_jobs,
+                summary.in_radius,
+                summary.scored,
+                summary.sent,
+                summary.cost_estimate,
+                run_id,
+            ),
+        )
+        self.conn.commit()
 
     def record_run(self, started_at: str, summary: RunSummary) -> int:
         cur = self.conn.execute(

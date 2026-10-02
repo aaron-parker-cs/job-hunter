@@ -26,6 +26,7 @@ from job_hunter.pipeline import ScoredJob, deliver, run_once
 from job_hunter.score import ScoreResult, load_text
 from job_hunter.secrets import Secrets, SecretsError, build_provider, load_secrets
 from job_hunter.service import heartbeat_file, heartbeat_is_fresh, prepare_scorer, serve
+from job_hunter.settings import effective_config
 from job_hunter.store import RunSummary, Store
 
 
@@ -67,6 +68,8 @@ def _print_scored(scored: list[ScoredJob], threshold: int) -> None:
             print(f"      + {reason}")
         for concern in r.concerns[:1]:
             print(f"      - {concern}")
+        if r.explanation:
+            print(f"      = {r.explanation}")
 
 
 async def _deliver(
@@ -190,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store = Store(db_path)
     try:
+        cfg = effective_config(cfg, store)  # honour /threshold, /radius, /location from chat
         scorer = prepare_scorer(cfg, secrets, store)
         summary, scored = run_once(
             cfg, store, Geocoder(store), scorer, dry_run=dry_run, weekly_budget=budget

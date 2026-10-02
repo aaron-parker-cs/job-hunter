@@ -88,9 +88,42 @@ anything. Dry runs still call the Anthropic API, so they cost a little.
 
 Global option (before the subcommand): `--config path/to/config.yaml`.
 
-In chat, both bots support `/status`, `/run`, `/pause`, `/resume` and `/top` (Discord: slash commands).
-`/pause` skips *scheduled* runs; `/run` always works. Button and reaction feedback is only collected
-while `run` is active.
+In chat, both bots support these commands (Discord: slash commands, replies visible only to you):
+
+| Command | What it does |
+| --- | --- |
+| `/status` | State, next and last run, spend, and the current threshold / radius / location |
+| `/run` | Start a run now (works even while paused) |
+| `/pause`, `/resume` | Skip / resume *scheduled* runs |
+| `/top` | Best unapplied matches from the last 7 days that clear the threshold |
+| `/last_scores [n]` | The top `n` (default 5, max 20) scores from the last run, each with the model's explanation and a mark for whether it cleared the threshold. **Discord: `/last-scores`** (Telegram doesn't allow hyphens in command names) |
+| `/threshold [x\|reset]` | Show, set (0-100) or reset the score needed to be notified |
+| `/radius [miles\|reset]` | Show, set (1-500) or reset the search radius |
+| `/location [City, ST\|reset]` | Show, set or reset the home location (checked on the map before it's saved) |
+
+Button and reaction feedback is only collected while `run` is active.
+
+### Score explanations
+
+Every scored job gets a plain-text explanation of at most 500 characters saying what drove its score
+(main matches, gaps, dealbreakers). It is stored with the score, printed by `once --dry-run`, and
+shown by `/last_scores` - the quickest way to see why a run produced nothing above your threshold.
+The model's reply is enforced as JSON by the API (structured outputs), and the explanation is required.
+Jobs scored before this feature existed have no explanation; `/last_scores` shows their reasons and
+concerns instead.
+
+### Changing settings from chat
+
+`/threshold`, `/radius` and `/location` change the running service without editing files or
+rebuilding. `config.yaml` stays the source of the starting values; a change made in chat is stored in
+the database as an *override* and wins until you `reset` it. Settings you haven't overridden keep
+following `config.yaml`, so editing the file (and restarting) still works for them. `/status` shows
+each value and where it came from, e.g. `65 (set from chat; config.yaml: 70)`.
+
+- **Threshold** applies to jobs scored from then on. Lowering it doesn't re-send old jobs, but
+  `/top` immediately lists recent ones that now clear it.
+- **Radius** and **location** apply from the next run, to both the search and the distance filter.
+  Jobs already saved keep the distance they were given.
 
 ## Creating the Telegram bot
 
@@ -151,8 +184,8 @@ table and counts equally.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `home_location` | *(required)* | City to search around and measure distance from, e.g. `Austin, TX` |
-| `radius_miles` | `50` | Keep jobs within this distance of home |
+| `home_location` | *(required)* | City to search around and measure distance from, e.g. `Austin, TX`. Overridable from chat: `/location` |
+| `radius_miles` | `50` | Keep jobs within this distance of home. Overridable from chat: `/radius` |
 | `include_remote` | `true` | Also keep jobs flagged remote |
 | `searches` | *(required)* | List of `- term: "..."` entries (max 200) |
 | `sites` | all but google | Any of `indeed`, `linkedin`, `zip_recruiter`, `glassdoor`, `google`. Google is opt-in because it currently returns nothing through JobSpy |
@@ -166,7 +199,7 @@ table and counts equally.
 | `exclude_companies` | `[]` | Company names to drop (case/punctuation-insensitive) |
 | `exclude_title_keywords` | `[]` | Whole-word, case-insensitive: `intern` won't match "International" |
 | `scoring.model` | `claude-haiku-4-5` | Any current Claude model, e.g. `claude-sonnet-5-5`. Requests adapt to what the model accepts (see below). Verify ids in Anthropic's docs |
-| `scoring.min_score_to_notify` | `70` | Score (0-100) needed to notify |
+| `scoring.min_score_to_notify` | `70` | Score (0-100) needed to notify. Overridable from chat: `/threshold` |
 | `scoring.max_jobs_scored_per_run` | `60` | Cost guardrail per run |
 | `notifier` | `telegram` | `telegram`, `discord` or `both` |
 | `notify.cooldown_seconds` | `300` | Minimum gap between job messages per notifier in `run` mode; `0` sends everything at once |
@@ -192,12 +225,13 @@ minutes) per notifier**, highest score first. So 8 matches take about 35 minutes
 
 ### Choosing a scoring model
 
-`scoring.model` can be any current Claude model. The scorer asks for structured output through a tool call and
-adapts to the model: newer models (Claude Sonnet 5.5, Opus 5.5, Fable 5.1) reject *forced* tool use, so the
-first rejected request switches that scorer to `tool_choice: auto` (with one re-ask if the model answers in
-prose), and `effort: low` is sent where supported and dropped where it isn't (Haiku 4.5). Replies leave room
-for the model's thinking tokens. `python -m job_hunter --model <id> --test-anthropic` runs this exact request
-on a sample job and reports which settings the model ended up using, so test a new model before a real run.
+`scoring.model` can be any current Claude model. Scores are requested with structured outputs
+(`output_config.format`), so the API guarantees the reply is JSON matching the score schema; this works on
+Haiku 4.5, Sonnet 5/5.5, Opus 4.8/5/5.5 and Fable. A model that rejects structured outputs falls back to the
+same schema as a tool call (forced where allowed, otherwise `tool_choice: auto` with one re-ask). `effort: low`
+is sent where supported and dropped where it isn't (Haiku 4.5), and replies leave room for thinking tokens.
+`python -m job_hunter --model <id> --test-anthropic` runs this exact request on a sample job and reports
+which mode the model ended up using and its explanation, so test a new model before a real run.
 
 ### Environment variables (non-secret)
 

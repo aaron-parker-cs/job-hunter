@@ -99,6 +99,24 @@ def make_service(
     return Service(make_cfg(), store, [rec], run_sync or default, weekly_budget=budget), rec
 
 
+def discord_interaction() -> Any:
+    """A fake interaction whose response tracks is_done() like discord.py's."""
+    state = {"done": False}
+
+    async def send_message(*a: Any, **k: Any) -> None:
+        state["done"] = True
+
+    async def defer(*a: Any, **k: Any) -> None:
+        state["done"] = True
+
+    response = SimpleNamespace(
+        send_message=AsyncMock(side_effect=send_message),
+        defer=AsyncMock(side_effect=defer),
+        is_done=lambda: state["done"],
+    )
+    return SimpleNamespace(response=response, followup=SimpleNamespace(send=AsyncMock()))
+
+
 @pytest.fixture
 def store() -> Store:
     return Store(":memory:")
@@ -111,7 +129,7 @@ def test_state_roundtrip_and_migration_version(store: Store) -> None:
     assert store.get_state("k", "dflt") == "dflt"
     store.set_state("k", "v")
     assert store.get_state("k") == "v"
-    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_top_matches_filters_and_orders(store: Store) -> None:
@@ -259,10 +277,13 @@ async def test_telegram_commands_registered_and_reply(store: Store) -> None:
     app = SimpleNamespace(add_handler=lambda h, group=0: handlers.append(h))
     telegram_bot.register_commands(app, service)  # type: ignore[arg-type]
     names = {next(iter(h.commands)) for h in handlers}
-    assert names == {"status", "run", "pause", "resume", "top"}
+    assert names == {
+        "status", "run", "pause", "resume", "top", "last_scores", "threshold", "radius", "location"
+    }  # fmt: skip
+    assert all("-" not in name for name in names)  # Telegram forbids hyphens in commands
     pause = next(h for h in handlers if "pause" in h.commands)
     message = SimpleNamespace(reply_text=AsyncMock())
-    await pause.callback(SimpleNamespace(effective_message=message), None)
+    await pause.callback(SimpleNamespace(effective_message=message), SimpleNamespace(args=[]))
     assert service.paused and "Paused" in message.reply_text.call_args.args[0]
 
 
@@ -285,7 +306,9 @@ def test_discord_slash_commands_and_guard(store: Store) -> None:
     bot = DiscordBot(store, 5, USER)
     register_commands(bot, service)
     assert bot.commands_enabled
-    assert {c.name for c in bot.tree.get_commands()} == {"status", "run", "pause", "resume", "top"}
+    assert {c.name for c in bot.tree.get_commands()} == {
+        "status", "run", "pause", "resume", "top", "last-scores", "threshold", "radius", "location"
+    }  # fmt: skip
     assert isinstance(bot.tree, GuardedTree)
 
 
@@ -303,7 +326,7 @@ async def test_discord_command_callback(store: Store) -> None:
     register_commands(bot, service)
     cmd = bot.tree.get_command("pause")
     assert cmd is not None
-    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+    interaction = discord_interaction()
     await cmd.callback(interaction)  # type: ignore[arg-type,call-arg]
     assert service.paused
     interaction.response.send_message.assert_awaited_once()

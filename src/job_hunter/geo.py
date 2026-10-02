@@ -34,7 +34,7 @@ def clean_location(text: str) -> str:
     return text.lower()
 
 
-def _nominatim_lookup(query: str) -> Coords | None:
+def nominatim_lookup(query: str) -> Coords | None:
     from geopy.geocoders import Nominatim
 
     geolocator = Nominatim(user_agent=USER_AGENT, timeout=10)
@@ -47,7 +47,7 @@ class Geocoder:
         self,
         store: Store,
         *,
-        lookup: Callable[[str], Coords | None] = _nominatim_lookup,
+        lookup: Callable[[str], Coords | None] = nominatim_lookup,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         min_interval: float = 1.0,

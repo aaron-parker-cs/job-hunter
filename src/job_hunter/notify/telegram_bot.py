@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import html
+import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from telegram import (
@@ -156,37 +157,55 @@ class TelegramNotifier:
         await handle_button(self._store, self._chat_id, update)
 
 
+TELEGRAM_MAX_CHARS = 4096
+
+# Telegram command names allow only letters, digits and underscores, hence last_scores here
+# where Discord has /last-scores.
 COMMAND_MENU = [
-    ("status", "Last run, next run and spend"),
+    ("status", "Last run, next run, spend and settings"),
     ("run", "Run a search now"),
     ("pause", "Pause scheduled runs"),
     ("resume", "Resume scheduled runs"),
     ("top", "Best unapplied matches this week"),
+    ("last_scores", "Top scores from the last run, with explanations: /last_scores [n]"),
+    ("threshold", "Show or set the notify threshold: /threshold 65 | reset"),
+    ("radius", "Show or set the search radius: /radius 30 | reset"),
+    ("location", "Show or set the home location: /location Tacoma, WA | reset"),
 ]
+
+CommandFn = Callable[["Service", str | None], "str | Awaitable[str]"]
 
 
 def register_commands(app: Application[Any, Any, Any, Any, Any, Any], service: Service) -> None:
-    """Add /status /run /pause /resume /top. The chat guard (group -1) filters senders."""
+    """Add the bot commands. The chat guard (group -1) already filters senders."""
 
-    def reply(make_text: Callable[[Service], str]) -> Any:
+    def reply(fn: CommandFn) -> Any:
         async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            if update.effective_message is not None:
-                await update.effective_message.reply_text(
-                    make_text(service), link_preview_options=NO_PREVIEW
-                )
+            if update.effective_message is None:
+                return
+            arg = " ".join(context.args or []) or None
+            text = fn(service, arg)
+            if inspect.isawaitable(text):
+                text = await text
+            for chunk in commands.split_message(str(text), TELEGRAM_MAX_CHARS):
+                await update.effective_message.reply_text(chunk, link_preview_options=NO_PREVIEW)
 
         return handler
 
-    table: dict[str, Callable[[Service], str]] = {
-        "status": commands.status_text,
-        "run": commands.run_text,
-        "pause": commands.pause_text,
-        "resume": commands.resume_text,
-        "top": commands.top_text,
+    table: dict[str, CommandFn] = {
+        "status": lambda s, a: commands.status_text(s),
+        "run": lambda s, a: commands.run_text(s),
+        "pause": lambda s, a: commands.pause_text(s),
+        "resume": lambda s, a: commands.resume_text(s),
+        "top": lambda s, a: commands.top_text(s),
+        "last_scores": commands.last_scores_text,
+        "threshold": commands.threshold_text,
+        "radius": commands.radius_text,
+        "location": commands.location_text,
     }
-    for name, make_text in table.items():
-        app.add_handler(CommandHandler(name, reply(make_text)))
+    for name, fn in table.items():
+        app.add_handler(CommandHandler(name, reply(fn)))
 
 
 async def set_command_menu(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
-    await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMAND_MENU])
+    await app.bot.set_my_commands([BotCommand(c, d[:256]) for c, d in COMMAND_MENU])

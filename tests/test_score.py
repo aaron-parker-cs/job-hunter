@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 from job_hunter.config import ConfigError, weekly_budget_from_env
 from job_hunter.models import Job
 from job_hunter.score import (
+    SCORE_SCHEMA,
     TOOL_NAME,
     ClaudeScorer,
     FatalScoringError,
@@ -28,6 +30,7 @@ JOB = Job(
 )  # fmt: skip
 
 GOOD = {
+    "explanation": "Strong DevOps overlap; salary meets the floor; commute is acceptable.",
     "score": 82,
     "verdict": "strong",
     "reasons": ["a", "b", "c", "d"],
@@ -38,10 +41,14 @@ GOOD = {
 
 
 def response(payload: dict[str, Any] | None = None, **usage: int) -> Any:
-    block = SimpleNamespace(type="tool_use", name=TOOL_NAME, input=payload or GOOD)
+    """A reply carrying the payload both as JSON text (structured outputs) and as a tool call,
+    so the same fake works whichever output mode the scorer is in."""
+    data = GOOD if payload is None else payload
+    text = SimpleNamespace(type="text", text=json.dumps(data))
+    tool = SimpleNamespace(type="tool_use", name=TOOL_NAME, input=data)
     u = {"input_tokens": 500, "output_tokens": 100, "cache_creation_input_tokens": 0}
     u |= {"cache_read_input_tokens": 0} | usage
-    return SimpleNamespace(content=[block], usage=SimpleNamespace(**u))
+    return SimpleNamespace(content=[text, tool], usage=SimpleNamespace(**u), stop_reason="end_turn")
 
 
 class FakeClient:
@@ -76,14 +83,14 @@ def test_parse_clamps_and_truncates() -> None:
     assert out.result.est_salary_ok is None
 
 
-def test_request_shape_forces_tool_and_caches_system_prompt() -> None:
+def test_request_shape_enforces_json_schema_and_caches_system_prompt() -> None:
     client = FakeClient(response())
     scorer(client).score(JOB)
     kw = client.calls[0]
-    assert kw["tool_choice"] == {"type": "tool", "name": TOOL_NAME}
+    assert kw["output_config"] == {"format": {"type": "json_schema", "schema": SCORE_SCHEMA}}
+    assert "tools" not in kw and "tool_choice" not in kw
     assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert kw["system"][0]["text"] == "SYSTEM"
-    assert kw["tools"][0]["name"] == TOOL_NAME
     assert "12 miles" in kw["messages"][0]["content"]
 
 
@@ -95,10 +102,18 @@ def test_invalid_payload_raises_scoring_error(payload: dict[str, Any]) -> None:
         scorer(FakeClient(response(payload))).score(JOB)
 
 
-def test_missing_tool_call() -> None:
+def test_empty_reply_in_json_mode() -> None:
     empty = SimpleNamespace(content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=1))
-    with pytest.raises(ScoringError, match="no record_score"):
+    with pytest.raises(ScoringError, match="not valid JSON"):
         scorer(FakeClient(empty)).score(JOB)
+
+
+def test_missing_tool_call_in_tool_mode() -> None:
+    empty = SimpleNamespace(content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+    s = scorer(FakeClient(empty))
+    s.output_mode = "tool"
+    with pytest.raises(ScoringError, match="no record_score"):
+        s.score(JOB)
 
 
 def test_retries_on_429_and_5xx_then_succeeds() -> None:
@@ -216,6 +231,7 @@ def test_credit_exhaustion_is_fatal() -> None:
 # --- model negotiation (Claude Sonnet 5.5 rejects forced tool use) ---------------------------
 
 FORCED_REJECTED = 'tool_choice: type "tool" and "any" are not supported for this model.'
+FORMAT_REJECTED = "output_config.format: structured outputs are not supported for this model."
 
 
 def bad_request(msg: str) -> anthropic.BadRequestError:
@@ -224,32 +240,39 @@ def bad_request(msg: str) -> anthropic.BadRequestError:
 
 
 def test_forced_tool_choice_rejected_falls_back_to_auto_and_remembers() -> None:
-    client = FakeClient(bad_request(FORCED_REJECTED), response(), response())
-    s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
+    client = FakeClient(
+        bad_request(FORMAT_REJECTED), bad_request(FORCED_REJECTED), response(), response()
+    )
+    s = ClaudeScorer(client, "older-model", "SYSTEM", sleep=lambda x: None)
     assert s.score(JOB).result.score == 82
-    assert client.calls[0]["tool_choice"]["type"] == "tool"
-    assert client.calls[1]["tool_choice"] == {"type": "auto"}
-    assert s.tool_mode == "auto"
-    s.score(JOB)  # the next job goes straight to auto: no wasted rejected call
-    assert len(client.calls) == 3 and client.calls[2]["tool_choice"] == {"type": "auto"}
+    assert "format" in client.calls[0]["output_config"]  # JSON mode first
+    assert client.calls[1]["tool_choice"]["type"] == "tool"  # then the tool fallback
+    assert client.calls[2]["tool_choice"] == {"type": "auto"}
+    assert s.describe_mode() == "tool (auto)"
+    s.score(JOB)  # the next job goes straight to auto: no wasted rejected calls
+    assert len(client.calls) == 4 and client.calls[3]["tool_choice"] == {"type": "auto"}
 
 
 def test_effort_sent_except_for_haiku_and_dropped_if_rejected() -> None:
     haiku = FakeClient(response())
     scorer(haiku).score(JOB)
-    assert "output_config" not in haiku.calls[0]  # Haiku 4.5 rejects effort
+    assert "effort" not in haiku.calls[0]["output_config"]  # Haiku 4.5 rejects effort
 
     client = FakeClient(bad_request("output_config.effort: not supported"), response())
     s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
     assert s.effort == "low" and client.calls == []
     s.score(JOB)
-    assert client.calls[0]["output_config"] == {"effort": "low"}
-    assert "output_config" not in client.calls[1] and s.effort is None
+    assert client.calls[0]["output_config"]["effort"] == "low"
+    assert "effort" not in client.calls[1]["output_config"] and s.effort is None
+    assert "format" in client.calls[1]["output_config"]  # JSON enforcement kept
 
 
 def test_both_features_can_be_negotiated_away_in_one_score() -> None:
     client = FakeClient(
-        bad_request(FORCED_REJECTED), bad_request("output_config.effort: nope"), response()
+        bad_request(FORMAT_REJECTED),
+        bad_request(FORCED_REJECTED),
+        bad_request("output_config.effort: nope"),
+        response(),
     )
     s = ClaudeScorer(client, "unknown-model", "SYSTEM", sleep=lambda x: None)
     assert s.score(JOB).result.score == 82
@@ -282,11 +305,13 @@ def test_auto_mode_nudges_once_when_model_answers_in_prose() -> None:
         ],
         usage=SimpleNamespace(input_tokens=420, output_tokens=90),
     )
-    client = FakeClient(bad_request(FORCED_REJECTED), prose, thinking_then_tool)
+    client = FakeClient(
+        bad_request(FORMAT_REJECTED), bad_request(FORCED_REJECTED), prose, thinking_then_tool
+    )
     s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
     out = s.score(JOB)
     assert out.result.score == 82  # thinking blocks are ignored, the tool call is found
-    assert "Call the record_score tool" in client.calls[2]["messages"][0]["content"]
+    assert "Call the record_score tool" in client.calls[3]["messages"][0]["content"]
     assert out.usage.input_tokens == 820 and out.usage.output_tokens == 110  # both calls billed
 
 
@@ -295,11 +320,11 @@ def test_auto_mode_gives_up_after_one_nudge() -> None:
         content=[SimpleNamespace(type="text", text="no tool")],
         usage=SimpleNamespace(input_tokens=1, output_tokens=1),
     )
-    client = FakeClient(bad_request(FORCED_REJECTED), prose, prose)
+    client = FakeClient(bad_request(FORMAT_REJECTED), bad_request(FORCED_REJECTED), prose, prose)
     s = ClaudeScorer(client, "claude-sonnet-5-5", "SYSTEM", sleep=lambda x: None)
     with pytest.raises(ScoringError, match="no record_score"):
         s.score(JOB)
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
 
 
 def test_pricing_matches_published_rates_per_model() -> None:

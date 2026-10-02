@@ -164,7 +164,7 @@ def _check_scoring_request(client: Any, model: str, out: Callable[[str], None]) 
     except ScoringError as exc:
         out(f"scoring request: FAILED: {exc}")
         return 1
-    notes = [f"tool_choice={scorer.tool_mode}"]
+    notes = [f"output={scorer.describe_mode()}"]
     if scorer.effort:
         notes.append(f"effort={scorer.effort}")
     r = outcome.result
@@ -172,4 +172,5 @@ def _check_scoring_request(client: Any, model: str, out: Callable[[str], None]) 
         f"scoring request: OK (sample job scored {r.score}/100, {r.verdict}; {', '.join(notes)}; "
         f"about ${outcome.cost_usd:.5f})"
     )
+    out(f"explanation: {r.explanation!r}")
     return 0

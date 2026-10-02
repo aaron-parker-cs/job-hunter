@@ -132,6 +132,8 @@ def score_jobs(
                 u.output_tokens,
                 u.cache_write_tokens,
                 u.cache_read_tokens,
+                explanation=outcome.result.explanation or None,
+                run_id=summary.run_id or None,
             )
         results.append(ScoredJob(job, outcome))
     return results
@@ -168,13 +170,15 @@ def run_once(
     in_radius = apply_location_filter(new, cfg, geocoder, home)
     summary.in_radius = len(in_radius)
 
+    if not dry_run:
+        summary.run_id = store.start_run(started)  # scores saved below point at this run
     try:
         scored = score_jobs(
             in_radius, cfg, store, scorer, summary, weekly_budget=weekly_budget, dry_run=dry_run
         )
     finally:
         if not dry_run:
-            summary.run_id = store.record_run(started, summary)
+            store.finish_run(summary.run_id, summary)
     scored.sort(key=lambda s: s.outcome.result.score, reverse=True)
     log.info(
         "run complete: fetched=%d new=%d in_radius=%d scored=%d cost=$%.4f dry_run=%s",

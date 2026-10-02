@@ -15,7 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from job_hunter.bootstrap import ensure_not_template
 from job_hunter.config import Config
-from job_hunter.geo import Geocoder
+from job_hunter.geo import Coords, Geocoder, clean_location, nominatim_lookup
 from job_hunter.notify.base import Notifier
 from job_hunter.pipeline import ScoredJob, deliver, run_once
 from job_hunter.score import (
@@ -26,6 +26,7 @@ from job_hunter.score import (
     make_scorer,
 )
 from job_hunter.secrets import Secrets
+from job_hunter.settings import effective_config
 from job_hunter.store import RunSummary, Store
 
 log = logging.getLogger(__name__)
@@ -76,9 +77,10 @@ def make_run_sync(
     def run() -> tuple[RunSummary, list[ScoredJob]]:
         store = Store(db_path)
         try:
-            scorer = prepare_scorer(cfg, secrets, store)
+            run_cfg = effective_config(cfg, store)  # chat overrides (/threshold etc.) apply now
+            scorer = prepare_scorer(run_cfg, secrets, store)
             return run_once(
-                cfg, store, Geocoder(store), scorer, dry_run=False, weekly_budget=weekly_budget
+                run_cfg, store, Geocoder(store), scorer, dry_run=False, weekly_budget=weekly_budget
             )
         finally:
             store.close()
@@ -96,9 +98,11 @@ class Service:
         *,
         weekly_budget: float | None = None,
         heartbeat_path: Path | None = None,
+        geocode_lookup: Callable[[str], Coords | None] = nominatim_lookup,
     ) -> None:
-        self.cfg = cfg
+        self.base_cfg = cfg  # config.yaml as loaded; see `cfg` for the effective values
         self.store = store
+        self._geocode_lookup = geocode_lookup
         self.weekly_budget = weekly_budget
         self._notifiers = notifiers
         self._run_sync = run_sync
@@ -108,6 +112,21 @@ class Service:
         self._next_run: Callable[[], datetime | None] = lambda: None
 
     # --- state --------------------------------------------------------------
+
+    @property
+    def cfg(self) -> Config:
+        """config.yaml plus anything changed from chat (/threshold, /radius, /location)."""
+        return effective_config(self.base_cfg, self.store)
+
+    async def locate(self, location: str) -> Coords | None:
+        """Geocode a location for /location (cached; the lookup runs off the event loop)."""
+        query = clean_location(location)
+        hit, coords = self.store.geocache_get(query)
+        if hit:
+            return coords
+        coords = await asyncio.to_thread(self._geocode_lookup, query)
+        self.store.geocache_put(query, coords)
+        return coords
 
     @property
     def paused(self) -> bool:
